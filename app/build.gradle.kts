@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "app.devicelock2"
+    namespace = "app.devicelock"
     compileSdk = 35
 
     defaultConfig {
