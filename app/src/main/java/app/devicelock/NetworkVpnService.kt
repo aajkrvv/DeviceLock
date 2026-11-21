@@ -3,7 +3,6 @@ package app.devicelock
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.ServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
@@ -18,6 +17,7 @@ import java.net.InetAddress
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import android.content.pm.ServiceInfo
 
 /** VPN 서비스가 공유하는 상태. 서비스는 시스템이 직접 (재)시작할 수 있으므로 값을 prefs 에도 남긴다. */
 object NetState {
