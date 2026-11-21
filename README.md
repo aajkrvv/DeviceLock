@@ -49,3 +49,8 @@ adb shell dpm set-device-owner app.devicelock/.DeviceLockAdminReceiver
 5. 시간대를 바꿔 규칙 경계(예: 1~2분 뒤)에서 자동으로 적용·해제되는지 확인
 6. 재부팅 후에도 상태가 유지되는지 확인
 7. 비밀번호 없이 규칙을 수정할 수 없는지, 5회 오입력 시 대기가 걸리는지 확인
+
+## 스마트 스위치 (실험 기능)
+
+삼성 스마트 스위치는 Device Owner 상태에서 기본 차단됩니다. 앱 메인 화면의 "스마트 스위치 허용" 스위치를 켜면
+`com.sec.android.easyMover` 에 관리 구성 값 `allow_run=true` 를 넣습니다. 이 방식이 실제로 동작하는지는 검증되지 않았으므로 실기기에서 확인이 필요합니다.

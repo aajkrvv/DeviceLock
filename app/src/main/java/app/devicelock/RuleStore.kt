@@ -23,6 +23,13 @@ class RuleStore(ctx: Context) {
         prefs.edit().putStringSet("suspended", s).commit()
     }
 
+    /** 스마트 스위치 허용 여부 (기본값: 꺼짐) */
+    fun isSmartSwitchAllowed(): Boolean = prefs.getBoolean("smartSwitch", false)
+
+    fun setSmartSwitchAllowed(v: Boolean) {
+        prefs.edit().putBoolean("smartSwitch", v).commit()
+    }
+
     /** 시스템이 일시중지를 거부해 차단하지 못한 패키지 (화면 표시용) */
     fun loadFailed(): Set<String> = prefs.getStringSet("failed", emptySet())!!.toSet()
 

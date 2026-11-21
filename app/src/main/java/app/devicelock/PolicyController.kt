@@ -4,6 +4,7 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.os.Build
+import android.os.Bundle
 import android.os.UserManager
 import android.provider.Settings
 
@@ -55,8 +56,26 @@ class PolicyController(private val ctx: Context) {
         // 기기 시간: 네트워크 시간 강제 + 수동 변경 메뉴 차단
         step("자동 시간 강제") { enforceAutoTime() }
         step("시간 설정 차단") { dpm.addUserRestriction(admin, UserManager.DISALLOW_CONFIG_DATE_TIME) }
+        step("스마트 스위치 설정") { applySmartSwitch(RuleStore(ctx).isSmartSwitchAllowed()) }
 
         return failures
+    }
+
+    /**
+     * 삼성 스마트 스위치는 Device Owner 상태에서 기본적으로 꺼진다.
+     * 관리 서비스가 하듯 관리 구성 값 allow_run=true 를 넣어 풀어 본다.
+     * 주의: 이 방식이 실제로 동작하는지는 검증되지 않았다(실기기 확인 필요).
+     */
+    fun applySmartSwitch(allowed: Boolean) {
+        if (!isDeviceOwner()) return
+        val b = Bundle()
+        if (allowed) b.putBoolean("allow_run", true)
+        // 빈 Bundle 을 넣으면 설정이 지워진다
+        dpm.setApplicationRestrictions(admin, SMART_SWITCH_PKG, b)
+    }
+
+    companion object {
+        const val SMART_SWITCH_PKG = "com.sec.android.easyMover"
     }
 
     private fun enforceAutoTime() {

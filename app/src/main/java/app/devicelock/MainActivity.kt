@@ -134,6 +134,7 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
     val store = remember { RuleStore(ctx) }
     var rules by remember { mutableStateOf(store.load()) }
     var unlocked by remember { mutableStateOf(Session.isUnlocked()) }
+    var smartSwitch by remember { mutableStateOf(store.isSmartSwitchAllowed()) }
     var notes by remember { mutableStateOf<List<String>>(emptyList()) }
     var pending by remember { mutableStateOf<(() -> Unit)?>(null) }
     var showPw by remember { mutableStateOf(false) }
@@ -194,6 +195,24 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                 } else {
                     Button(onClick = { pending = null; showPw = true }) { Text("잠금 해제") }
                 }
+            }
+        }
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("스마트 스위치 허용")
+                    Text(
+                        "삼성 스마트 스위치는 Device Owner 상태에서 기본 차단됩니다. 켜면 허용 설정을 시도합니다(동작 미검증).",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(checked = smartSwitch, onCheckedChange = { on ->
+                    guard {
+                        store.setSmartSwitchAllowed(on)
+                        smartSwitch = on
+                        runCatching { policy.applySmartSwitch(on) }
+                    }
+                })
             }
         }
         item {
