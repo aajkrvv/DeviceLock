@@ -17,6 +17,15 @@
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
+    <!-- 위치 예외(반경 + 시간대): 예외 시간대가 활성인 동안에만 시스템 위치 업데이트를 받는다. Device Owner 권한으로 스스로에게 부여한다. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- VPN 서비스 포그라운드 실행(Android 8+) 및 Device Owner 앱의 systemExempted 타입(Android 14+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+
     <!-- 런처에 보이는 앱 목록을 읽기 위한 패키지 가시성 선언 -->
     <queries>
         <intent>
@@ -52,6 +61,17 @@
                 <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
             </intent-filter>
         </receiver>
+
+        <!-- 내장 DNS VPN(허용 도메인만 통과)과 강력 모드 대기 중 완전 차단에 쓰는 로컬 VPN. 외부 서버로 트래픽을 보내지 않는다. -->
+        <service
+            android:name=".NetworkVpnService"
+            android:exported="false"
+            android:foregroundServiceType="systemExempted"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
 
         <receiver
             android:name=".SchedulerReceiver"

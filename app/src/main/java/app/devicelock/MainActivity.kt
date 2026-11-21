@@ -4,9 +4,13 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.net.VpnService
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -156,6 +160,21 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
     var uninstallStep by remember { mutableStateOf(0) } // 0 없음, 1 비밀번호 확인, 2 최종 확인
     var uninstallError by remember { mutableStateOf<String?>(null) }
 
+    val strong = remember { StrongMode(ctx) }
+    var strongOn by remember { mutableStateOf(strong.isOn()) }
+    var phase by remember { mutableStateOf<StrongPhase>(strong.phase()) }
+    var confirmStrong by remember { mutableStateOf(false) }
+    var editingNet by remember { mutableStateOf(false) }
+
+    // 편집 가능 여부: 일반 모드는 비밀번호 입력 후 5분, 강력 모드는 24시간 대기가 끝난 구간 안에서 비밀번호 입력 후 5분
+    fun canEdit(): Boolean =
+        Session.isUnlocked() && (!strong.isOn() || strong.phase() is StrongPhase.Ready)
+
+    val vpnLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        statusTick++
+        scope.launch { withContext(Dispatchers.Default) { RuleEngine.evaluate(ctx, force = true) } }
+    }
+
     LaunchedEffect(Unit) {
         notes = withContext(Dispatchers.Default) {
             val failures = policy.applyBaseline()
@@ -165,7 +184,15 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
         statusTick++
         while (true) {
             delay(3000)
-            unlocked = Session.isUnlocked()
+            val before = phase
+            val after = strong.phase()
+            phase = after
+            unlocked = canEdit()
+            // 대기 시작·종료·편집 구간 종료 때 네트워크 상태를 즉시 맞춘다
+            if (after::class != before::class) {
+                withContext(Dispatchers.Default) { RuleEngine.evaluate(ctx, force = true) }
+                statusTick++
+            }
             // 제거를 시도하다 취소하는 등 Device Owner 가 내려간 경우 화면을 안내 화면으로 되돌린다
             if (!policy.isDeviceOwner()) {
                 (ctx as? Activity)?.recreate()
@@ -177,12 +204,16 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
     fun commit(next: RuleSet) {
         store.save(next)
         rules = next
-        RuleEngine.evaluate(ctx)
         statusTick++
+        // Private DNS 확인 등 시간이 걸릴 수 있어 메인 스레드에서 돌리지 않는다
+        scope.launch {
+            withContext(Dispatchers.Default) { RuleEngine.evaluate(ctx) }
+            statusTick++
+        }
     }
 
     fun guard(action: () -> Unit) {
-        if (Session.isUnlocked()) action() else {
+        if (canEdit()) action() else {
             pending = action
             showPw = true
         }
@@ -193,6 +224,11 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
     val syncErrors = remember(rules, notes, statusTick) { store.loadSyncErrors() }
     val netError = remember(rules, notes, statusTick) { store.loadNetError() }
     val loadIssue = remember(rules, notes, statusTick) { store.loadIssue() }
+    val vpnError = remember(rules, notes, statusTick) { NetState.error(ctx) }
+    val needVpnConsent = remember(statusTick) { runCatching { VpnService.prepare(ctx) != null }.getOrDefault(false) }
+    val geoKnown = remember(rules, statusTick) { LocationGate.current(ctx) != null }
+    val geoIssue = remember(rules, statusTick) { LocationGate.issue(ctx) }
+    val geoPermOk = remember(rules, statusTick) { LocationGate.hasPermission(ctx) && LocationGate.hasBackgroundPermission(ctx) }
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
@@ -216,6 +252,7 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                     }
                     syncErrors.forEach { Text("· $it", color = MaterialTheme.colorScheme.error) }
                     netError?.let { Text("네트워크 제한: $it", color = MaterialTheme.colorScheme.error) }
+                    vpnError?.let { Text("VPN: $it", color = MaterialTheme.colorScheme.error) }
                     loadIssue?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 }
             }
@@ -231,6 +268,42 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
             }
         }
 
+        // ---- 강력 모드 ----
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("강력 모드", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                "켜면 규칙을 바꾸거나 앱을 제거하기 전에 비밀번호를 입력하고 24시간 동안 일반 앱의 인터넷 연결이 VPN 잠금으로 차단된 채 기다려야 합니다. 일부 시스템 앱은 예외일 수 있습니다. 한 번 켜면 앱에서 끌 수 없습니다.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Switch(
+                            checked = strongOn,
+                            enabled = !strongOn,
+                            onCheckedChange = { on -> if (on && !strongOn) guard { confirmStrong = true } },
+                        )
+                    }
+                    when (val p = phase) {
+                        is StrongPhase.Waiting -> {
+                            Text(
+                                "대기 중 — 남은 시간 ${formatDuration(p.remainingMs)}. 일반 앱의 인터넷 연결이 차단되어 있습니다(일부 시스템 앱 예외 가능).",
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            OutlinedButton(onClick = { pending = null; showPw = true }) { Text("대기 중단…") }
+                        }
+                        is StrongPhase.Ready ->
+                            Text("규칙 변경 가능 구간 — 남은 시간 ${formatDuration(p.remainingMs)} (비밀번호 입력 필요)")
+                        is StrongPhase.Idle ->
+                            Text("규칙을 바꾸려면 비밀번호를 입력해 24시간 대기를 시작해야 합니다.", style = MaterialTheme.typography.bodySmall)
+                        else -> {}
+                    }
+                }
+            }
+        }
+
         // ---- 네트워크 화이트리스트 ----
         item {
             Card(Modifier.fillMaxWidth()) {
@@ -239,7 +312,7 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                         Column(Modifier.weight(1f)) {
                             Text("네트워크 화이트리스트", style = MaterialTheme.typography.titleMedium)
                             Text(
-                                "켜면 허용한 주소 외에는 접속이 막힙니다. VPN을 쓰지 않고 시스템 프록시 설정으로 동작합니다.",
+                                "허용 주소 규칙을 프록시 또는 내장 DNS VPN 으로 적용합니다. Private DNS 는 DNS 서버만 지정하며 단독으로 허용 목록을 차단하지 않습니다.",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -258,10 +331,45 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                     } else {
                         Text("꺼져 있습니다. 아래 도메인 허용 규칙은 켜야 적용됩니다.", style = MaterialTheme.typography.bodySmall)
                     }
+                    Text("차단 방식: " + modesLabel(rules), style = MaterialTheme.typography.bodySmall)
                     Text(
-                        "한계: 시스템 프록시 설정을 따르는 앱(브라우저 등)만 걸러집니다. 프록시를 무시하는 앱(일부 게임·메신저)은 막지 못합니다.",
+                        "프록시는 시스템 프록시를 따르는 앱에만 적용됩니다. 내장 DNS VPN 은 UDP 53 DNS 질의 필터이며 IP 직접 접속·자체 DoH/DoT·TCP DNS는 막지 못합니다. Private DNS 단독은 차단 기능이 아닙니다.",
                         style = MaterialTheme.typography.bodySmall,
                     )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { guard { editingNet = true } }) { Text("차단 방식 선택") }
+                        if (needVpnConsent) {
+                            OutlinedButton(onClick = {
+                                VpnService.prepare(ctx)?.let { vpnLauncher.launch(it) }
+                            }) { Text("VPN 권한 허용") }
+                        }
+                    }
+                    if (needVpnConsent) {
+                        Text(
+                            "내장 DNS VPN 과 강력 모드의 일반 앱 인터넷 차단은 VPN 권한이 필요합니다. 일부 시스템 통신은 Android가 예외 처리할 수 있습니다.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    if (rules.hasExemptions()) {
+                        Text(
+                            "위치 예외: " + (if (geoKnown) "최근 위치 확인됨" else "위치 미확인(예외 적용 안 됨)"),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        geoIssue?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                        if (!geoPermOk) {
+                            Text(
+                                "위치 권한(항상 허용)이 필요합니다. 자동 부여가 거부된 기기에서는 직접 허용해 주세요.",
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            OutlinedButton(onClick = {
+                                ctx.startActivity(
+                                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }) { Text("앱 권한 설정 열기") }
+                        }
+                    }
                 }
             }
         }
@@ -319,6 +427,7 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                             })
                         }
                         Text("차단 ${r.schedule.summary()} · 앱 ${r.packages.size}개", style = MaterialTheme.typography.bodySmall)
+                        r.exemption?.let { Text("위치 예외 · ${it.summary()}", style = MaterialTheme.typography.bodySmall) }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             TextButton(onClick = { guard { editing = r } }) { Text("수정") }
                             TextButton(onClick = { guard { deleteRule = r } }) { Text("삭제") }
@@ -338,6 +447,7 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                             })
                         }
                         Text("허용 ${r.schedule.summary()}", style = MaterialTheme.typography.bodySmall)
+                        r.exemption?.let { Text("위치 예외 · ${it.summary()}", style = MaterialTheme.typography.bodySmall) }
                         Text(
                             r.domains.take(3).joinToString(", ") + if (r.domains.size > 3) " 외 ${r.domains.size - 3}개" else "",
                             style = MaterialTheme.typography.bodySmall,
@@ -357,37 +467,118 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("앱 제거", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "비밀번호를 입력하면 모든 제한을 풀고 Device Owner 를 내려놓은 뒤 이 앱을 제거합니다.",
+                        "비밀번호를 입력하면 앱 차단·네트워크 제한을 풀고 Device Owner 해제를 시도한 뒤 이 앱을 제거합니다." +
+                            if (strongOn) " 강력 모드에서는 24시간 대기가 끝난 구간에서만 가능합니다." else "",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                    OutlinedButton(onClick = { uninstallStep = 1 }) { Text("비밀번호로 앱 제거") }
+                    OutlinedButton(onClick = {
+                        // 강력 모드: 대기 시작/대기 중 안내를 먼저 거친다. 편집 가능 구간에서만 제거 절차로 넘어간다.
+                        if (strongOn && phase !is StrongPhase.Ready) { pending = null; showPw = true } else uninstallStep = 1
+                    }) { Text("비밀번호로 앱 제거") }
                 }
             }
         }
     }
 
     if (showPw) {
-        PasswordDialog(
-            store = pw,
-            onDismiss = { showPw = false; pending = null },
-            onOk = {
-                showPw = false
-                unlocked = true
-                pending?.invoke()
-                pending = null
-            },
-        )
+        val p = phase
+        if (strongOn && p is StrongPhase.Waiting) {
+            StrongWaitDialog(
+                remainingMs = p.remainingMs,
+                onKeepWaiting = { showPw = false; pending = null },
+                onCancelWait = {
+                    strong.cancelWait()
+                    phase = strong.phase()
+                    unlocked = false
+                    showPw = false
+                    pending = null
+                    scope.launch {
+                        withContext(Dispatchers.Default) { RuleEngine.evaluate(ctx, force = true) }
+                        statusTick++
+                    }
+                },
+            )
+        } else if (strongOn && p !is StrongPhase.Ready) {
+            PasswordDialog(
+                store = pw,
+                title = "강력 모드 — 24시간 대기 시작",
+                message = "비밀번호를 입력하면 24시간 대기가 시작되고, 그 동안 일반 앱의 인터넷 연결이 VPN 잠금으로 차단됩니다(일부 시스템 앱 예외 가능). " +
+                    "대기가 끝난 뒤 30분 동안만 규칙을 바꿀 수 있습니다. 중간에 중단하면 처음부터 다시 기다려야 합니다.",
+                grantSession = false,
+                onDismiss = { showPw = false; pending = null },
+                onOk = {
+                    // VPN 승인이 없으면 24시간 타이머를 시작하지 않는다. 권한 승인 후 사용자가 다시 시작해야 한다.
+                    val consent = VpnService.prepare(ctx)
+                    if (consent != null) {
+                        showPw = false
+                        pending = null
+                        vpnLauncher.launch(consent)
+                    } else {
+                        strong.startWait()
+                        Session.lock()
+                        unlocked = false
+                        phase = strong.phase()
+                        showPw = false
+                        pending = null
+                        scope.launch {
+                            withContext(Dispatchers.Default) { RuleEngine.evaluate(ctx, force = true) }
+                            statusTick++
+                        }
+                    }
+                },
+            )
+        } else {
+            PasswordDialog(
+                store = pw,
+                onDismiss = { showPw = false; pending = null },
+                onOk = {
+                    showPw = false
+                    unlocked = true
+                    pending?.invoke()
+                    pending = null
+                },
+            )
+        }
+    }
+    if (confirmStrong) {
+        ConfirmDialog(
+            "강력 모드 켜기",
+            "한 번 켜면 다시 끌 수 없습니다. 이후에는 규칙 변경·앱 제거 때마다 비밀번호를 입력하고 24시간 동안 " +
+                "일반 앱의 인터넷 연결이 차단된 채 기다려야 하며, 대기가 끝난 뒤 30분 동안만 변경할 수 있습니다. " +
+                "비밀번호를 잃어버리면 기기 초기화 외에는 방법이 없습니다. 켤까요?",
+            { confirmStrong = false },
+        ) {
+            confirmStrong = false
+            guard {
+                strong.enable()
+                Session.lock()
+                strongOn = true
+                unlocked = false
+                phase = strong.phase()
+                // VPN 권한은 대기 시작 시 다시 확인한다. 이 단계는 강력 모드만 영구 활성화한다.
+            }
+        }
+    }
+    if (editingNet) {
+        NetModesDialog(rules.netModes, rules.privateDnsHost, { editingNet = false }) { modes, host ->
+            editingNet = false
+            guard {
+                commit(rules.copy(netModes = modes, privateDnsHost = host))
+                if (NET_DNS_VPN in modes) VpnService.prepare(ctx)?.let { vpnLauncher.launch(it) }
+            }
+        }
     }
     if (confirmNetOn) {
         val none = rules.domainRules.none { it.enabled }
         ConfirmDialog(
             "네트워크 화이트리스트 켜기",
             (if (none) "허용 규칙이 하나도 없어 인터넷이 사실상 모두 끊깁니다. " else "") +
-                "허용한 주소 외에는 시스템 프록시를 따르는 앱의 접속이 막힙니다. 켤까요?",
+                "선택 방식: ${modesLabel(rules)}. 프록시는 시스템 프록시를 따르는 앱만, 내장 DNS VPN은 제한적인 DNS 질의만 필터링합니다. " +
+                "Private DNS는 DNS 서버 지정일 뿐 허용 목록을 강제하지 않습니다. 켤까요?",
             { confirmNetOn = false },
         ) {
             confirmNetOn = false
-            commit(rules.copy(netWhitelist = true))
+            guard { commit(rules.copy(netWhitelist = true)) }
         }
     }
     if (creating) {
@@ -460,8 +651,8 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
     if (uninstallStep == 2) {
         ConfirmDialog(
             "앱 제거",
-            "모든 앱 차단과 네트워크 제한이 풀리고, 이 앱이 Device Owner 에서 내려온 뒤 제거 화면이 열립니다. " +
-                "제거 화면에서 취소하면 제한이 풀린 채로 남으니, 이어서 직접 제거하거나 adb 로 Device Owner 를 다시 설정해야 합니다. 계속할까요?",
+            "앱 차단과 네트워크 제한을 해제하고 Device Owner 해제를 시도합니다. Android API는 이 해제 방식을 테스트 용도로만 안내하며, 기기에 따라 실패하거나 일부 정책이 남을 수 있습니다. " +
+                "제거 화면에서 취소하면 일부 제한은 이미 풀린 상태일 수 있습니다. 계속할까요?",
             { uninstallStep = 0 },
         ) {
             uninstallStep = 0
@@ -478,4 +669,12 @@ fun MainScreen(policy: PolicyController, pw: PasswordStore) {
     uninstallError?.let { msg ->
         ConfirmDialog("앱 제거 실패", msg, { uninstallError = null }) { uninstallError = null }
     }
+}
+
+private fun modesLabel(rules: RuleSet): String {
+    val parts = ArrayList<String>()
+    if (NET_PROXY in rules.netModes) parts += "프록시"
+    if (NET_DNS_VPN in rules.netModes) parts += "내장 DNS VPN"
+    if (NET_PRIVATE_DNS in rules.netModes) parts += "Private DNS(${rules.privateDnsHost})"
+    return parts.joinToString(" + ").ifEmpty { "없음" }
 }

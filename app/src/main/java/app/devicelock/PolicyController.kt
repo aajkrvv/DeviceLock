@@ -2,6 +2,7 @@ package app.devicelock
 
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
+import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
@@ -14,6 +15,27 @@ import android.util.Log
 
 /** 일시중지 동기화 결과. refused: 시스템이 거부한 앱, missing: 설치되어 있지 않은 앱 */
 data class SyncResult(val refused: Set<String>, val missing: Set<String>, val errors: List<String>)
+
+/**
+ * 한 시점에 적용해야 하는 네트워크 상태.
+ * @param blackout 강력 모드 대기 중: 모든 통신 차단(화이트리스트 설정과 무관)
+ * @param whitelistOn 화이트리스트가 켜져 있는지
+ * @param allowed 지금 허용할 사용자 도메인(whitelistOn 일 때)
+ */
+data class NetPlan(
+    val blackout: Boolean,
+    val whitelistOn: Boolean,
+    val allowed: Set<String>,
+    val modes: Set<String>,
+    val privateDnsHost: String,
+) {
+    val vpnMode: String
+        get() = when {
+            blackout -> NetState.VPN_BLACKHOLE
+            whitelistOn && NET_DNS_VPN in modes -> NetState.VPN_DNS
+            else -> NetState.VPN_OFF
+        }
+}
 
 /**
  * Device Owner 권한으로 거는 정책 모음.
@@ -72,6 +94,9 @@ class PolicyController(private val ctx: Context) {
         step("시간 설정 차단") { dpm.addUserRestriction(admin, UserManager.DISALLOW_CONFIG_DATE_TIME) }
         step("스마트 스위치 설정") { applySmartSwitch(RuleStore(ctx).isSmartSwitchAllowed()) }
 
+        // 위치 예외용 권한. Android 12 이상에서는 기기에 따라 거부될 수 있어 실패해도 오류로 세지 않는다(화면의 위치 상태에서 확인).
+        runCatching { grantLocationPermissions() }
+
         return failures
     }
 
@@ -89,6 +114,23 @@ class PolicyController(private val ctx: Context) {
         if (allowed) b.putBoolean("allow_run", true)
         // 빈 Bundle 을 넣으면 설정이 지워진다
         dpm.setApplicationRestrictions(admin, SMART_SWITCH_PKG, b)
+    }
+
+    /** 위치 예외에 필요한 위치 권한을 Device Owner 권한으로 스스로에게 부여한다. */
+    fun grantLocationPermissions() {
+        if (!isDeviceOwner()) return
+        val perms = listOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+        )
+        for (perm in perms) {
+            runCatching {
+                dpm.setPermissionGrantState(
+                    admin, ctx.packageName, perm, DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED,
+                )
+            }
+        }
     }
 
     private fun enforceAutoTime() {
@@ -179,27 +221,49 @@ class PolicyController(private val ctx: Context) {
     }
 
     // ------------------------------------------------------------------
-    // 네트워크 화이트리스트 (VPN 미사용)
+    // 네트워크 제한: 프록시 / Private DNS / 내장 DNS VPN 을 선택해 적용하고, 강력 모드 대기 중에는 전부 차단한다
     // ------------------------------------------------------------------
 
     /**
-     * 전역 HTTP 프록시를 "반드시 실패하는 주소"로 지정하고, 허용 도메인만 프록시 예외 목록에 넣는다.
-     * 예외 목록에 있는 주소는 프록시를 거치지 않고 바로 접속하고, 나머지는 닫힌 포트로 가서 실패한다.
-     * 상주 서비스·VPN·로컬 프록시 서버가 필요 없다.
+     * 계획(NetPlan)대로 네트워크 제한을 맞춘다. 방식별로 서명을 저장해, 바뀐 부분만 다시 적용한다.
      *
-     * 한계: 시스템 프록시 설정을 따르는 앱(브라우저, 대부분의 HTTP 앱)만 걸러진다.
-     * 프록시를 무시하는 앱(일부 게임·메신저의 자체 소켓, UDP 등)은 이 방식으로 막을 수 없다.
+     * - 프록시: 전역 프록시를 닫힌 포트로 지정하고 허용 도메인만 예외 목록에 넣는다. 프록시 설정을 따르는 앱만 걸러진다.
+     * - Private DNS: 지정한 DNS-over-TLS 호스트를 강제한다. 허용 목록은 그 DNS 서비스(예: 허용 목록 기능이 있는 서비스)가 가진다.
+     * - 내장 DNS VPN: 이 앱의 로컬 VPN 이 DNS 질의에서 허용 도메인만 통과시킨다(시간 규칙 반영). 다른 VPN 과 동시에 쓸 수 없다.
+     * - 강력 모드 대기(blackout): 프록시는 예외 없이 닫고, 로컬 VPN 으로 전체 트래픽을 버리며 상시 VPN 차단(lockdown)을 건다.
      *
-     * @param allowed null 이면 화이트리스트 끔(프록시 해제). 아니면 지금 허용할 사용자 도메인.
-     * @return 실패 사유. 성공이면 null
+     * @return 실패 사유. 모두 성공이면 null
      */
-    fun syncNetwork(allowed: Set<String>?, force: Boolean = false): String? {
+    fun syncNetwork(plan: NetPlan, force: Boolean = false): String? {
         if (!isDeviceOwner()) return null
         val store = RuleStore(ctx)
-        val entries = allowed?.let { Domains.bypassEntries(Domains.SYSTEM_ALLOWED + it) }
-        val signature = if (entries == null) "off" else "on:" + entries.joinToString(",")
-        if (!force && store.loadNetSignature() == signature) return null
+        val modes = plan.modes
+        val vpnMode = plan.vpnMode
+        if (vpnMode == NetState.VPN_DNS) NetState.setDnsAllowed(ctx, plan.allowed) // 시간 규칙 반영(서명과 무관)
 
+        val proxyEntries: List<String>? = when {
+            plan.blackout -> emptyList()
+            plan.whitelistOn && NET_PROXY in modes -> Domains.bypassEntries(Domains.SYSTEM_ALLOWED + plan.allowed)
+            else -> null
+        }
+        val privateDns: String? =
+            if (!plan.blackout && plan.whitelistOn && NET_PRIVATE_DNS in modes && plan.privateDnsHost.isNotBlank())
+                plan.privateDnsHost.trim()
+            else null
+
+        val errors = listOfNotNull(
+            applyProxy(store, proxyEntries, force),
+            applyPrivateDns(store, privateDns, force),
+            applyVpn(store, vpnMode, force),
+        )
+        val error = errors.joinToString("; ").ifEmpty { null }
+        store.saveNetError(error)
+        return error
+    }
+
+    private fun applyProxy(store: RuleStore, entries: List<String>?, force: Boolean): String? {
+        val sig = if (entries == null) "off" else "on:" + entries.joinToString(",")
+        if (!force && store.loadNetSignature("proxy") == sig) return null
         val error: String? = try {
             if (entries == null) {
                 dpm.setRecommendedGlobalProxy(admin, null)
@@ -215,14 +279,114 @@ class PolicyController(private val ctx: Context) {
                 if (isOurProxyActive()) null else "프록시가 적용되었는지 확인하지 못했습니다(적용되지 않았을 수 있음)"
             }
         } catch (e: Exception) {
-            Log.e(TAG, "syncNetwork 실패", e)
-            "네트워크 제한 적용 실패 (${e.javaClass.simpleName})"
+            Log.e(TAG, "프록시 적용 실패", e)
+            "프록시 적용 실패 (${e.javaClass.simpleName})"
         }
-
-        store.saveNetError(error)
         // 성공했을 때만 서명을 저장해, 실패하면 다음 평가에서 다시 시도한다
-        store.saveNetSignature(if (error == null) signature else null)
+        store.saveNetSignature("proxy", if (error == null) sig else null)
         return error
+    }
+
+    private fun applyPrivateDns(store: RuleStore, host: String?, force: Boolean): String? {
+        val sig = host ?: "off"
+        if (!force && store.loadNetSignature("pdns") == sig) return null
+        if (host == null && !store.isPrivateDnsOwned()) {
+            // 우리가 바꾼 적이 없으면 사용자의 Private DNS 설정은 건드리지 않는다.
+            store.saveNetSignature("pdns", sig)
+            return null
+        }
+        val error: String? = try {
+            if (host == null) {
+                val oldMode = store.priorPrivateDnsMode()
+                val result = when (oldMode) {
+                    DevicePolicyManager.PRIVATE_DNS_MODE_PROVIDER_HOSTNAME -> {
+                        val oldHost = store.priorPrivateDnsHost()
+                        if (oldHost.isNullOrBlank()) DevicePolicyManager.PRIVATE_DNS_SET_ERROR_FAILURE_SETTING
+                        else dpm.setGlobalPrivateDnsModeSpecifiedHost(admin, oldHost)
+                    }
+                    // DevicePolicyManager 에는 OFF 로 되돌리는 API 가 없다. OFF 였던 경우에는 자동(기회적) 모드로 복원한다.
+                    else -> dpm.setGlobalPrivateDnsModeOpportunistic(admin)
+                }
+                if (result == DevicePolicyManager.PRIVATE_DNS_SET_NO_ERROR) {
+                    store.setPrivateDnsOwned(false)
+                    store.clearPrivateDnsSnapshot()
+                    if (oldMode == DevicePolicyManager.PRIVATE_DNS_MODE_OFF) {
+                        Log.w(TAG, "Private DNS 의 원래 OFF 상태는 DevicePolicyManager API로 복원할 수 없어 자동 모드로 복원했습니다")
+                    }
+                    null
+                } else "Private DNS 복원 실패 (코드 $result)"
+            } else {
+                // 기존 시스템 설정은 최초 1회만 저장한다. 앱을 거듭 평가해도 원래 값이 덮이지 않는다.
+                if (!store.isPrivateDnsOwned() && !store.hasPrivateDnsSnapshot()) {
+                    store.savePrivateDnsSnapshot(
+                        dpm.getGlobalPrivateDnsMode(admin),
+                        dpm.getGlobalPrivateDnsHost(admin),
+                    )
+                }
+                when (val r = dpm.setGlobalPrivateDnsModeSpecifiedHost(admin, host)) {
+                    DevicePolicyManager.PRIVATE_DNS_SET_NO_ERROR -> {
+                        store.setPrivateDnsOwned(true)
+                        null
+                    }
+                    DevicePolicyManager.PRIVATE_DNS_SET_ERROR_HOST_NOT_SERVING ->
+                        "Private DNS 호스트에 연결하지 못했습니다(주소 확인 또는 네트워크 연결 필요)"
+                    else -> "Private DNS 설정 실패 (코드 $r)"
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Private DNS 적용 실패", e)
+            "Private DNS 적용 실패 (${e.javaClass.simpleName})"
+        }
+        store.saveNetSignature("pdns", if (error == null) sig else null)
+        return error
+    }
+
+    private fun applyVpn(store: RuleStore, mode: String, force: Boolean): String? {
+        // 서비스가 죽어 있으면(사용자가 다른 VPN 을 켜서 해제된 경우 등) 서명이 같아도 다시 시작한다.
+        val alive = mode == NetState.VPN_OFF || NetworkVpnService.running
+        if (!force && alive && store.loadNetSignature("vpn") == mode) return null
+        val error: String? = try {
+            NetState.setVpnMode(ctx, mode)
+            if (mode == NetState.VPN_OFF) {
+                if (store.isAlwaysOnOwned()) restorePreviousAlwaysOnVpn(store)
+                NetworkVpnService.stop(ctx)
+                NetState.setError(ctx, null)
+            } else {
+                // 타사 VPN 의 기존 Always-on 설정을 먼저 저장한다. 앱 자체 VPN 을 해제할 때 복원한다.
+                if (!store.isAlwaysOnOwned() && !store.hasAlwaysOnSnapshot()) {
+                    val previous = dpm.getAlwaysOnVpnPackage(admin)
+                    val lockdown = previous != null && dpm.isAlwaysOnVpnLockdownEnabled(admin)
+                    store.saveAlwaysOnSnapshot(previous, lockdown)
+                }
+                dpm.setAlwaysOnVpnPackage(admin, ctx.packageName, mode == NetState.VPN_BLACKHOLE)
+                store.setAlwaysOnOwned(true)
+                NetworkVpnService.apply(ctx)
+            }
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "VPN 적용 실패", e)
+            "VPN 적용 실패 (${e.javaClass.simpleName})"
+        }
+        store.saveNetSignature("vpn", if (error == null) mode else null)
+        return error
+    }
+
+    /** 이 앱의 VPN을 끄면서, takeover 전에 저장한 상시 VPN 설정을 복원한다. */
+    private fun restorePreviousAlwaysOnVpn(store: RuleStore) {
+        if (store.hasAlwaysOnSnapshot()) {
+            val oldPackage = store.priorAlwaysOnPackage()
+            val oldLockdown = store.priorAlwaysOnLockdown()
+            if (oldPackage == null) {
+                dpm.setAlwaysOnVpnPackage(admin, null, false)
+            } else {
+                dpm.setAlwaysOnVpnPackage(admin, oldPackage, oldLockdown)
+            }
+            store.clearAlwaysOnSnapshot()
+        } else {
+            // 이전 버전에서 snapshot 없이 소유 상태만 저장된 경우의 안전한 fallback.
+            dpm.setAlwaysOnVpnPackage(admin, null, false)
+        }
+        store.setAlwaysOnOwned(false)
     }
 
     private fun isOurProxyActive(): Boolean {
@@ -242,6 +406,9 @@ class PolicyController(private val ctx: Context) {
     @Suppress("DEPRECATION")
     fun releaseForUninstall(): List<String> {
         if (!isDeviceOwner()) return listOf("Device Owner 권한이 없습니다")
+        if (StrongMode(ctx).isOn() && StrongMode(ctx).phase() !is StrongPhase.Ready) {
+            return listOf("강력 모드에서는 24시간 대기가 끝난 30분 편집 가능 구간에서만 앱을 제거할 수 있습니다")
+        }
         val failures = mutableListOf<String>()
 
         fun step(name: String, block: () -> Unit) {
@@ -258,6 +425,27 @@ class PolicyController(private val ctx: Context) {
             setSuspended(all - ctx.packageName, false, mutableListOf())
         }
         step("네트워크 제한 해제") { dpm.setRecommendedGlobalProxy(admin, null) }
+        step("VPN 해제 및 기존 상시 VPN 복원") {
+            if (store.isAlwaysOnOwned()) restorePreviousAlwaysOnVpn(store)
+            NetworkVpnService.stop(ctx)
+            NetState.setVpnMode(ctx, NetState.VPN_OFF)
+        }
+        step("Private DNS 해제 및 기존 설정 복원") {
+            if (store.isPrivateDnsOwned()) {
+                val oldMode = store.priorPrivateDnsMode()
+                val result = if (oldMode == DevicePolicyManager.PRIVATE_DNS_MODE_PROVIDER_HOSTNAME) {
+                    val oldHost = store.priorPrivateDnsHost()
+                    if (oldHost.isNullOrBlank()) DevicePolicyManager.PRIVATE_DNS_SET_ERROR_FAILURE_SETTING
+                    else dpm.setGlobalPrivateDnsModeSpecifiedHost(admin, oldHost)
+                } else dpm.setGlobalPrivateDnsModeOpportunistic(admin)
+                if (result != DevicePolicyManager.PRIVATE_DNS_SET_NO_ERROR) {
+                    throw IllegalStateException("Private DNS 복원 실패 (코드 $result)")
+                }
+                store.setPrivateDnsOwned(false)
+                store.clearPrivateDnsSnapshot()
+            }
+        }
+        step("위치 확인 해제") { LocationGate.refresh(ctx, needed = false, reregister = true) }
         step("스마트 스위치 설정 해제") { dpm.setApplicationRestrictions(admin, SMART_SWITCH_PKG, Bundle()) }
 
         for (key in RELEASE_RESTRICTIONS) {
@@ -268,7 +456,15 @@ class PolicyController(private val ctx: Context) {
         }
         step("제거 차단 해제") { dpm.setUninstallBlocked(admin, ctx.packageName, false) }
 
-        // 위 단계에서 실패가 있어도 Device Owner 해제는 시도한다. 해제되면 남은 정책도 함께 사라진다.
+        // 네트워크 원복에 실패했다면 Device Owner 를 유지한다. 남은 Always-on VPN 때문에 통신이 막히는 것을 방지.
+        if (store.isAlwaysOnOwned() || store.isPrivateDnsOwned() || isOurProxyActive()) {
+            failures += "네트워크 설정 복원에 실패해 Device Owner 해제를 중단했습니다. 상태를 확인한 뒤 다시 시도하세요."
+            runCatching { applyBaseline() }
+            runCatching { RuleEngine.evaluate(ctx, force = true) }
+            return failures
+        }
+
+        // Android API 는 Device Owner 해제를 테스트 용도로만 안내하므로 실패 가능성을 UI 에 표시한다.
         var cleared = false
         try {
             dpm.clearDeviceOwnerApp(ctx.packageName)
@@ -284,7 +480,7 @@ class PolicyController(private val ctx: Context) {
             if (failures.isEmpty()) failures += "Device Owner 가 해제되지 않았습니다"
             return failures
         }
-        store.saveNetSignature(null)
+        store.clearNetSignatures()
         return emptyList()
     }
 

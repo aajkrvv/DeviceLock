@@ -23,8 +23,53 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
+      # 매번 같은 키로 서명해야 이전 빌드 위에 업데이트 설치가 된다.
+      # 키스토어는 저장소에 넣지 않고 GitHub Secrets 에만 둔다(README 의 "서명 키 만들기" 참고).
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          missing=""
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::서명용 Secrets 가 없습니다:$missing  (Settings > Secrets and variables > Actions 에서 등록하세요. README 참고)"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # 비밀번호·별칭이 맞는지 빌드 전에 확인한다
+          keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Set monotonically increasing Android versionCode
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # 같은 workflow 를 재실행해도 이전 APK 와 versionCode 가 겹치지 않게 한다.
+          version_code=$(( RUN_NUMBER * 1000 + RUN_ATTEMPT ))
+          if [ "$version_code" -gt 2100000000 ]; then
+            echo "::error::Android versionCode 한도(2,100,000,000)를 초과했습니다. 수동 조정이 필요합니다."
+            exit 1
+          fi
+          echo "VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+
       - name: Build release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: gradle assembleRelease --no-daemon
+
+      # 서명 인증서 지문이 매번 같은지 로그에서 확인할 수 있다(공개 정보)
+      - name: Show signing certificate
+        run: |
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          "$apksigner" verify --print-certs app/build/outputs/apk/release/*.apk | grep -i "SHA-256" || true
 
       - uses: actions/upload-artifact@v4
         with:

@@ -78,11 +78,76 @@ class RuleStore(ctx: Context) {
         prefs.edit().putStringSet("syncErrors", l.take(5).toSet()).commit()
     }
 
-    /** 네트워크 제한 적용 결과. 마지막으로 성공 적용한 상태의 서명(같으면 다시 적용하지 않는다) */
-    fun loadNetSignature(): String? = prefs.getString("netSig", null)
+    /**
+     * 네트워크 제한 적용 결과. part(proxy / pdns / vpn)별로 마지막에 성공 적용한 상태의 서명을 저장한다.
+     * 서명이 같으면 다시 적용하지 않는다.
+     */
+    fun loadNetSignature(part: String): String? = prefs.getString("netSig_$part", null)
 
-    fun saveNetSignature(s: String?) {
-        prefs.edit().apply { if (s == null) remove("netSig") else putString("netSig", s) }.commit()
+    fun saveNetSignature(part: String, s: String?) {
+        prefs.edit().apply { if (s == null) remove("netSig_$part") else putString("netSig_$part", s) }.commit()
+    }
+
+    fun clearNetSignatures() {
+        prefs.edit().remove("netSig_proxy").remove("netSig_pdns").remove("netSig_vpn").commit()
+    }
+
+    /** 이 앱이 Private DNS 를 지정해 둔 상태인지(복원 여부 판단용. 사용자가 직접 정한 설정을 건드리지 않기 위함) */
+    fun isPrivateDnsOwned(): Boolean = prefs.getBoolean("pdnsOwned", false)
+
+    fun setPrivateDnsOwned(v: Boolean) {
+        prefs.edit().putBoolean("pdnsOwned", v).commit()
+    }
+
+    /** 이 앱이 상시 VPN 을 지정해 둔 상태인지(사용자가 직접 정한 상시 VPN 을 지우지 않기 위함) */
+    fun isAlwaysOnOwned(): Boolean = prefs.getBoolean("alwaysOnOwned", false)
+
+    fun setAlwaysOnOwned(v: Boolean) {
+        prefs.edit().putBoolean("alwaysOnOwned", v).commit()
+    }
+
+    fun hasAlwaysOnSnapshot(): Boolean = prefs.getBoolean("alwaysOnSnapshot", false)
+
+    fun saveAlwaysOnSnapshot(packageName: String?, lockdown: Boolean) {
+        prefs.edit().apply {
+            putBoolean("alwaysOnSnapshot", true)
+            putBoolean("priorAlwaysOnLockdown", lockdown)
+            if (packageName == null) remove("priorAlwaysOnPackage")
+            else putString("priorAlwaysOnPackage", packageName)
+        }.commit()
+    }
+
+    fun priorAlwaysOnPackage(): String? = prefs.getString("priorAlwaysOnPackage", null)
+
+    fun priorAlwaysOnLockdown(): Boolean = prefs.getBoolean("priorAlwaysOnLockdown", false)
+
+    fun clearAlwaysOnSnapshot() {
+        prefs.edit().remove("alwaysOnSnapshot")
+            .remove("priorAlwaysOnPackage")
+            .remove("priorAlwaysOnLockdown")
+            .commit()
+    }
+
+    /** Private DNS 설정을 처음 변경하기 직전의 모드와 호스트. */
+    fun hasPrivateDnsSnapshot(): Boolean = prefs.getBoolean("pdnsSnapshot", false)
+
+    fun savePrivateDnsSnapshot(mode: Int, host: String?) {
+        prefs.edit().apply {
+            putBoolean("pdnsSnapshot", true)
+            putInt("priorPdnsMode", mode)
+            if (host == null) remove("priorPdnsHost") else putString("priorPdnsHost", host)
+        }.commit()
+    }
+
+    fun priorPrivateDnsMode(): Int = prefs.getInt("priorPdnsMode", -1)
+
+    fun priorPrivateDnsHost(): String? = prefs.getString("priorPdnsHost", null)
+
+    fun clearPrivateDnsSnapshot() {
+        prefs.edit().remove("pdnsSnapshot")
+            .remove("priorPdnsMode")
+            .remove("priorPdnsHost")
+            .commit()
     }
 
     fun loadNetError(): String? = prefs.getString("netErr", null)

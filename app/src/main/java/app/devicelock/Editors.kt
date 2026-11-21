@@ -134,6 +134,94 @@ fun ScheduleFields(f: ScheduleForm, daysLabel: String, allDayLabel: String) {
     }
 }
 
+// ----------------------------------------------------------------------
+// 위치 예외 입력 (앱 차단 규칙과 도메인 허용 규칙이 함께 쓴다)
+// ----------------------------------------------------------------------
+
+@Stable
+class ExemptionForm(ex: Exemption?) {
+    var enabled by mutableStateOf(ex != null)
+    var lat by mutableStateOf(ex?.lat?.toString() ?: "")
+    var lon by mutableStateOf(ex?.lon?.toString() ?: "")
+    var radius by mutableStateOf((ex?.radiusM ?: 200).toString())
+    val window = ScheduleForm(ex?.window ?: Schedule(allDay = false, startMin = 21 * 60, endMin = 6 * 60))
+
+    /** 꺼져 있으면 (null, null). 오류면 (null, 메시지) */
+    fun build(): Pair<Exemption?, String?> {
+        if (!enabled) return null to null
+        val la = lat.trim().toDoubleOrNull()
+        val lo = lon.trim().toDoubleOrNull()
+        val r = radius.trim().toIntOrNull()
+        val (w, windowErr) = window.build()
+        val err = when {
+            la == null || la < -90.0 || la > 90.0 -> "위도는 -90~90 사이 숫자로 입력해 주세요"
+            lo == null || lo < -180.0 || lo > 180.0 -> "경도는 -180~180 사이 숫자로 입력해 주세요"
+            r == null || r < Exemption.MIN_RADIUS || r > Exemption.MAX_RADIUS ->
+                "반경은 ${Exemption.MIN_RADIUS}~${Exemption.MAX_RADIUS}m 로 입력해 주세요"
+            else -> windowErr
+        }
+        if (err != null || la == null || lo == null || r == null || w == null) return null to (err ?: "위치 예외 입력을 확인해 주세요")
+        return Exemption(la, lo, r, w) to null
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun ExemptionFields(f: ExemptionForm) {
+    val ctx = LocalContext.current
+    var msg by remember { mutableStateOf<String?>(null) }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("위치 예외 (일시 비활성화)", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+        Switch(checked = f.enabled, onCheckedChange = { f.enabled = it })
+    }
+    if (!f.enabled) return
+
+    Text(
+        "아래 위치의 반경 안에 있고, 아래 시간대에 해당하는 동안 이 규칙을 일시적으로 끕니다. " +
+            "위치를 알 수 없거나 확인된 지 오래됐으면 규칙은 그대로 적용됩니다.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = f.lat, onValueChange = { f.lat = it }, singleLine = true,
+            label = { Text("위도") }, modifier = Modifier.weight(1f),
+        )
+        OutlinedTextField(
+            value = f.lon, onValueChange = { f.lon = it }, singleLine = true,
+            label = { Text("경도") }, modifier = Modifier.weight(1f),
+        )
+    }
+    OutlinedButton(onClick = {
+        val g = LocationGate.lastKnownForSetup(ctx)
+        if (g == null) {
+            msg = "현재 위치를 가져오지 못했습니다. 위치 권한과 기기 위치 설정을 확인하고, 지도 앱 등으로 위치를 한 번 확인한 뒤 다시 시도해 주세요."
+        } else {
+            f.lat = g.lat.toString()
+            f.lon = g.lon.toString()
+            msg = null
+        }
+    }) { Text("현재 위치 사용") }
+
+    Text("반경", style = MaterialTheme.typography.labelLarge)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOf(100, 200, 300, 500, 1000).forEach { m ->
+            FilterChip(
+                selected = f.radius.trim() == m.toString(),
+                onClick = { f.radius = m.toString() },
+                label = { Text("${m}m") },
+            )
+        }
+    }
+    OutlinedTextField(
+        value = f.radius, onValueChange = { f.radius = it }, singleLine = true,
+        label = { Text("반경 직접 입력 (m)") }, modifier = Modifier.fillMaxWidth(),
+    )
+    msg?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+
+    ScheduleFields(f.window, daysLabel = "예외 적용 요일 (선택 없음 = 매일)", allDayLabel = "하루 종일")
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GroupChips(groups: List<Group>, selectedId: String, onSelect: (String) -> Unit) {
@@ -157,6 +245,7 @@ fun RuleEditorDialog(initial: AppRule?, groups: List<Group>, onDismiss: () -> Un
     var packages by remember { mutableStateOf(initial?.packages?.toSet() ?: emptySet()) }
     var err by remember { mutableStateOf<String?>(null) }
     var pickApps by remember { mutableStateOf(false) }
+    val exForm = remember { ExemptionForm(initial?.exemption) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -168,6 +257,7 @@ fun RuleEditorDialog(initial: AppRule?, groups: List<Group>, onDismiss: () -> Un
                 OutlinedButton(onClick = { pickApps = true }) { Text("차단할 앱 선택 (${packages.size}개)") }
 
                 ScheduleFields(form, daysLabel = "차단 요일 (선택 없음 = 매일)", allDayLabel = "하루 종일")
+                ExemptionFields(exForm)
 
                 err?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
@@ -175,10 +265,11 @@ fun RuleEditorDialog(initial: AppRule?, groups: List<Group>, onDismiss: () -> Un
         confirmButton = {
             TextButton(onClick = {
                 val (sched, schedErr) = form.build()
+                val (exemption, exErr) = exForm.build()
                 err = when {
                     name.isBlank() -> "규칙 이름을 입력해 주세요"
                     packages.isEmpty() -> "차단할 앱을 한 개 이상 선택해 주세요"
-                    else -> schedErr
+                    else -> schedErr ?: exErr
                 }
                 if (err == null && sched != null) {
                     onSave(
@@ -189,6 +280,7 @@ fun RuleEditorDialog(initial: AppRule?, groups: List<Group>, onDismiss: () -> Un
                             packages = packages.toList().sorted(),
                             schedule = sched,
                             enabled = initial?.enabled ?: true,
+                            exemption = exemption,
                         ),
                     )
                 }
@@ -223,6 +315,7 @@ fun DomainRuleEditorDialog(
     var groupId by remember { mutableStateOf(initial?.groupId ?: groups.first().id) }
     var text by remember { mutableStateOf(initial?.domains?.joinToString("\n") ?: "") }
     var err by remember { mutableStateOf<String?>(null) }
+    val exForm = remember { ExemptionForm(initial?.exemption) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -246,6 +339,7 @@ fun DomainRuleEditorDialog(
 
                 ScheduleFields(form, daysLabel = "허용 요일 (선택 없음 = 매일)", allDayLabel = "하루 종일 허용")
                 Text("위 요일·시간에만 허용됩니다. 그 밖의 시간에는 네트워크 화이트리스트가 막습니다.", style = MaterialTheme.typography.bodySmall)
+                ExemptionFields(exForm)
 
                 err?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
@@ -253,6 +347,7 @@ fun DomainRuleEditorDialog(
         confirmButton = {
             TextButton(onClick = {
                 val (sched, schedErr) = form.build()
+                val (exemption, exErr) = exForm.build()
                 val parsed = text.split(Regex("[\\s,;]+")).filter { it.isNotBlank() }.map { it to Domains.normalize(it) }
                 val bad = parsed.filter { it.second == null }.map { it.first }
                 val domains = parsed.mapNotNull { it.second }.distinct().sorted()
@@ -265,7 +360,7 @@ fun DomainRuleEditorDialog(
                             "(한글 도메인, IPv6, 점이 없는 이름은 지원하지 않습니다)"
                     domains.isEmpty() -> "허용할 주소를 한 개 이상 입력해 주세요"
                     listLen > Domains.MAX_LIST_CHARS -> "허용 도메인이 너무 많습니다. 다른 규칙과 합쳐 전체 개수를 줄여 주세요"
-                    else -> schedErr
+                    else -> schedErr ?: exErr
                 }
                 if (err == null && sched != null) {
                     onSave(
@@ -276,6 +371,7 @@ fun DomainRuleEditorDialog(
                             domains = domains,
                             schedule = sched,
                             enabled = initial?.enabled ?: true,
+                            exemption = exemption,
                         ),
                     )
                 }

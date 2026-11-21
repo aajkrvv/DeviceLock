@@ -16,6 +16,9 @@ object Domains {
         "clients3.google.com",
     )
 
+    /** 내장 DNS VPN 방식에서 추가로 항상 허용하는 주소(시간 동기화). 하위 도메인도 허용된다. */
+    val DNS_EXTRA_ALLOWED: List<String> = listOf("time.android.com", "pool.ntp.org")
+
     /** 시스템 프록시 예외 목록의 문자열 길이 한도(5000자)보다 여유를 둔 값 */
     const val MAX_LIST_CHARS = 4800
 
@@ -58,6 +61,18 @@ object Domains {
             if (!isIpv4(d)) out += "*.$d"
         }
         return out.toList()
+    }
+
+    /** name 이 allowed 의 도메인이거나 그 하위 도메인이면 true */
+    fun matchesAllowed(name: String, allowed: Set<String>): Boolean {
+        var n = name.lowercase().trimEnd('.')
+        while (n.isNotEmpty()) {
+            if (n in allowed) return true
+            val i = n.indexOf('.')
+            if (i < 0) return false
+            n = n.substring(i + 1)
+        }
+        return false
     }
 
     /** 콤마로 이어 붙였을 때의 길이 */

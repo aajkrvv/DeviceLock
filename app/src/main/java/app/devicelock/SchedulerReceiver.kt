@@ -3,6 +3,9 @@ package app.devicelock
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.location.Location
+import android.location.LocationManager
+import android.os.Build
 import android.util.Log
 
 /**
@@ -14,24 +17,42 @@ import android.util.Log
 class SchedulerReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        try {
-            val policy = PolicyController(context)
-            if (!policy.isDeviceOwner()) return
+        val pending = goAsync()
+        val app = context.applicationContext
+        Thread({
+            try {
+                val policy = PolicyController(app)
+                if (!policy.isDeviceOwner()) return@Thread
 
-            when (intent.action) {
-                Intent.ACTION_BOOT_COMPLETED,
-                Intent.ACTION_MY_PACKAGE_REPLACED -> {
-                    policy.applyBaseline()
-                    RuleEngine.evaluate(context, force = true)
+                when (intent.action) {
+                    Intent.ACTION_BOOT_COMPLETED,
+                    Intent.ACTION_MY_PACKAGE_REPLACED -> {
+                        LocationGate.reset(app) // 재부팅·업데이트로 위치 업데이트 등록이 사라진다
+                        policy.applyBaseline()
+                        RuleEngine.evaluate(app, force = true)
+                    }
+                    LocationGate.ACTION_LOCATION -> {
+                        extractLocation(intent)?.let { LocationGate.onLocation(app, it) }
+                        RuleEngine.evaluate(app, fromLocation = true)
+                    }
+                    else -> RuleEngine.evaluate(app)
                 }
-                else -> RuleEngine.evaluate(context)
+            } catch (t: Throwable) {
+                Log.e("SchedulerReceiver", "처리 실패", t)
+                runCatching { RuleEngine.evaluate(app) }
+            } finally {
+                pending.finish()
             }
-        } catch (t: Throwable) {
-            Log.e("SchedulerReceiver", "처리 실패", t)
-            // 어떻게든 다음 평가가 예약되도록 한 번 더 시도한다
-            runCatching { RuleEngine.evaluate(context) }
-        }
+        }, "devicelock-scheduler").start()
     }
+
+    @Suppress("DEPRECATION")
+    private fun extractLocation(i: Intent): Location? =
+        if (Build.VERSION.SDK_INT >= 33) {
+            i.getParcelableExtra(LocationManager.KEY_LOCATION_CHANGED, Location::class.java)
+        } else {
+            i.getParcelableExtra(LocationManager.KEY_LOCATION_CHANGED) as? Location
+        }
 
     companion object {
         const val ACTION_TICK = "app.devicelock.TICK"

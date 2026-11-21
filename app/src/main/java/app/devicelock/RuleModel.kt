@@ -4,6 +4,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
 import java.time.LocalDateTime
+import kotlin.math.asin
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * 규칙이 "적용되는" 시간 조건.
@@ -66,6 +71,64 @@ data class Schedule(
     }
 }
 
+/** 평가 시점에 확인된 기기 위치. 위치를 모르거나 오래됐으면 null 로 넘긴다(= 예외 적용 안 됨, 제한 유지). */
+data class GeoState(val lat: Double, val lon: Double, val accuracyM: Double = 0.0)
+
+/** 두 좌표 사이의 거리(미터, haversine) */
+fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+    val r = 6_371_000.0
+    val p1 = Math.toRadians(lat1)
+    val p2 = Math.toRadians(lat2)
+    val dp = p2 - p1
+    val dl = Math.toRadians(lon2 - lon1)
+    val a = sin(dp / 2).pow(2) + cos(p1) * cos(p2) * sin(dl / 2).pow(2)
+    return 2 * r * asin(sqrt(a.coerceIn(0.0, 1.0)))
+}
+
+/**
+ * 위치 예외: 기기가 (lat, lon) 반경 radiusM 안에 있고, 현재 시각이 window 에 해당하는 동안 규칙을 일시적으로 끈다.
+ * 위치를 알 수 없으면 예외는 적용되지 않는다(= 규칙 유지).
+ */
+data class Exemption(
+    val lat: Double,
+    val lon: Double,
+    val radiusM: Int,
+    val window: Schedule,
+) {
+    fun isActive(now: LocalDateTime, geo: GeoState?): Boolean {
+        if (geo == null || !window.isActive(now)) return false
+        // 위치 오차 반경까지 고려해 실제로 구역 안이라고 보수적으로 판단한다.
+        return distanceMeters(lat, lon, geo.lat, geo.lon) + geo.accuracyM <= radiusM
+    }
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("lat", lat)
+        put("lon", lon)
+        put("radiusM", radiusM)
+        put("window", window.toJson())
+    }
+
+    companion object {
+        const val MIN_RADIUS = 50
+        const val MAX_RADIUS = 10_000
+
+        fun fromJson(o: JSONObject): Exemption = Exemption(
+            lat = o.getDouble("lat"),
+            lon = o.getDouble("lon"),
+            radiusM = o.optInt("radiusM", 100).coerceIn(MIN_RADIUS, MAX_RADIUS),
+            window = Schedule.fromJson(o.getJSONObject("window")),
+        )
+    }
+}
+
+fun Exemption.summary(): String = "반경 ${radiusM}m · 예외 시간 ${window.summary()}"
+
+const val NET_PROXY = "proxy"
+const val NET_PRIVATE_DNS = "private_dns"
+const val NET_DNS_VPN = "dns_vpn"
+val DEFAULT_NET_MODES: Set<String> = setOf(NET_PROXY)
+private val KNOWN_NET_MODES = setOf(NET_PROXY, NET_PRIVATE_DNS, NET_DNS_VPN)
+
 data class Group(val id: String, val name: String, val enabled: Boolean = true)
 
 /** 앱 차단 규칙: 스케줄에 해당하는 동안 packages 를 일시중지한다. */
@@ -76,6 +139,7 @@ data class AppRule(
     val packages: List<String>,
     val schedule: Schedule = Schedule(),
     val enabled: Boolean = true,
+    val exemption: Exemption? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -84,6 +148,7 @@ data class AppRule(
         put("packages", JSONArray(packages))
         put("schedule", schedule.toJson())
         put("enabled", enabled)
+        if (exemption != null) put("exemption", exemption.toJson())
     }
 
     companion object {
@@ -96,6 +161,7 @@ data class AppRule(
                 packages = (0 until pk.length()).map { pk.getString(it) },
                 schedule = o.optJSONObject("schedule")?.let { Schedule.fromJson(it) } ?: Schedule(),
                 enabled = o.optBoolean("enabled", true),
+                exemption = o.optJSONObject("exemption")?.let { runCatching { Exemption.fromJson(it) }.getOrNull() },
             )
         }
     }
@@ -113,6 +179,7 @@ data class DomainRule(
     val domains: List<String>,
     val schedule: Schedule = Schedule(),
     val enabled: Boolean = true,
+    val exemption: Exemption? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -121,6 +188,7 @@ data class DomainRule(
         put("domains", JSONArray(domains))
         put("schedule", schedule.toJson())
         put("enabled", enabled)
+        if (exemption != null) put("exemption", exemption.toJson())
     }
 
     companion object {
@@ -134,6 +202,7 @@ data class DomainRule(
                 domains = (0 until dm.length()).mapNotNull { Domains.normalize(dm.optString(it, "")) }.distinct(),
                 schedule = o.optJSONObject("schedule")?.let { Schedule.fromJson(it) } ?: Schedule(),
                 enabled = o.optBoolean("enabled", true),
+                exemption = o.optJSONObject("exemption")?.let { runCatching { Exemption.fromJson(it) }.getOrNull() },
             )
         }
     }
@@ -149,34 +218,56 @@ data class RuleSet(
     val rules: List<AppRule>,
     val domainRules: List<DomainRule> = emptyList(),
     val netWhitelist: Boolean = false,
+    /** 화이트리스트를 적용하는 방식(NET_PROXY, NET_PRIVATE_DNS, NET_DNS_VPN 중 여러 개). */
+    val netModes: Set<String> = DEFAULT_NET_MODES,
+    /** NET_PRIVATE_DNS 에서 쓸 DNS-over-TLS 호스트 이름 */
+    val privateDnsHost: String = "",
 ) {
 
     private fun enabledGroupIds(): Set<String> = groups.filter { it.enabled }.map { it.id }.toSet()
 
-    /** 지금 시각에 차단되어야 하는 패키지 집합 */
-    fun blockedPackages(now: LocalDateTime): Set<String> {
+    /** 지금 시각에 차단되어야 하는 패키지 집합. 위치 예외가 적용 중인 규칙은 제외된다. */
+    fun blockedPackages(now: LocalDateTime, geo: GeoState? = null): Set<String> {
         val enabledGroups = enabledGroupIds()
         val out = HashSet<String>()
         for (r in rules) {
-            if (r.enabled && r.groupId in enabledGroups && r.schedule.isActive(now)) out.addAll(r.packages)
+            if (r.enabled && r.groupId in enabledGroups && r.schedule.isActive(now) &&
+                r.exemption?.isActive(now, geo) != true
+            ) out.addAll(r.packages)
         }
         return out
     }
 
-    /** 지금 시각에 허용되는 도메인 집합(사용자 규칙만; 시스템 필수 주소는 별도) */
-    fun allowedDomains(now: LocalDateTime): Set<String> {
+    /** 지금 시각에 허용되는 도메인 집합(사용자 규칙만; 시스템 필수 주소는 별도). 위치 예외가 적용 중인 규칙은 제외된다. */
+    fun allowedDomains(now: LocalDateTime, geo: GeoState? = null): Set<String> {
         val enabledGroups = enabledGroupIds()
         val out = HashSet<String>()
         for (r in domainRules) {
-            if (r.enabled && r.groupId in enabledGroups && r.schedule.isActive(now)) out.addAll(r.domains)
+            if (r.enabled && r.groupId in enabledGroups && r.schedule.isActive(now) &&
+                r.exemption?.isActive(now, geo) != true
+            ) out.addAll(r.domains)
         }
         return out
     }
 
-    fun enforcementAt(now: LocalDateTime): Enforcement =
-        Enforcement(blockedPackages(now), if (netWhitelist) allowedDomains(now) else null)
+    fun enforcementAt(now: LocalDateTime, geo: GeoState? = null): Enforcement =
+        Enforcement(blockedPackages(now, geo), if (netWhitelist) allowedDomains(now, geo) else null)
 
-    fun allSchedules(): List<Schedule> = rules.map { it.schedule } + domainRules.map { it.schedule }
+    fun allSchedules(): List<Schedule> =
+        rules.map { it.schedule } + domainRules.map { it.schedule } +
+            rules.mapNotNull { it.exemption?.window } + domainRules.mapNotNull { it.exemption?.window }
+
+    fun hasExemptions(): Boolean = rules.any { it.exemption != null } || domainRules.any { it.exemption != null }
+
+    /** 지금 시각이 어떤 활성 규칙의 위치 예외 시간대에 들어 있는지(= 위치를 확인해야 하는지) */
+    fun exemptionWindowActive(now: LocalDateTime): Boolean {
+        val g = enabledGroupIds()
+        return rules.any {
+            it.enabled && it.groupId in g && it.schedule.isActive(now) && it.exemption?.window?.isActive(now) == true
+        } || domainRules.any {
+            it.enabled && it.groupId in g && it.schedule.isActive(now) && it.exemption?.window?.isActive(now) == true
+        }
+    }
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("groups", JSONArray().also { a ->
@@ -187,6 +278,8 @@ data class RuleSet(
         put("rules", JSONArray().also { a -> rules.forEach { a.put(it.toJson()) } })
         put("domainRules", JSONArray().also { a -> domainRules.forEach { a.put(it.toJson()) } })
         put("netWhitelist", netWhitelist)
+        put("netModes", JSONArray(netModes.sorted()))
+        put("privateDnsHost", privateDnsHost)
     }
 
     companion object {
@@ -225,7 +318,21 @@ data class RuleSet(
                     }
                 }
             }
-            return RuleSet(groups, rules, domainRules, o.optBoolean("netWhitelist", false))
+            val parsedModes = o.optJSONArray("netModes")?.let { a ->
+                (0 until a.length()).map { a.optString(it, "") }.filter { it in KNOWN_NET_MODES }.toSet()
+            }
+            // Private DNS 는 내장 VPN 과 병행할 수 없으므로, 손상/구버전 설정에서 둘 다 있으면 DNS VPN 을 우선한다.
+            val modes = parsedModes?.let {
+                if (NET_PRIVATE_DNS in it && NET_DNS_VPN in it) it - NET_PRIVATE_DNS else it
+            }
+            return RuleSet(
+                groups = groups,
+                rules = rules,
+                domainRules = domainRules,
+                netWhitelist = o.optBoolean("netWhitelist", false),
+                netModes = if (modes.isNullOrEmpty()) DEFAULT_NET_MODES else modes,
+                privateDnsHost = o.optString("privateDnsHost", ""),
+            )
         }
     }
 }
