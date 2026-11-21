@@ -1,6 +1,7 @@
 package app.devicelock
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Base64
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -34,7 +35,12 @@ class PasswordStore(ctx: Context) {
 
     fun verify(password: String): VerifyResult {
         val now = System.currentTimeMillis()
-        val lockedUntil = prefs.getLong("lockedUntil", 0L)
+        var lockedUntil = prefs.getLong("lockedUntil", 0L)
+        // 시계가 뒤로 가서 잠금이 비정상적으로 길어지는 일을 막는다(최대 대기 시간으로 보정)
+        if (lockedUntil - now > MAX_WAIT_MS) {
+            lockedUntil = now + MAX_WAIT_MS
+            prefs.edit().putLong("lockedUntil", lockedUntil).commit()
+        }
         if (now < lockedUntil) return VerifyResult.LockedOut(lockedUntil)
 
         val salt = Base64.decode(prefs.getString("salt", "") ?: "", Base64.NO_WRAP)
@@ -47,11 +53,15 @@ class PasswordStore(ctx: Context) {
         val fails = prefs.getInt("fails", 0) + 1
         val edit = prefs.edit().putInt("fails", fails)
         if (fails >= 5) {
-            val wait = minOf(30_000L * (1L shl minOf(fails - 5, 7)), 3_600_000L)
+            val wait = minOf(30_000L * (1L shl minOf(fails - 5, 7)), MAX_WAIT_MS)
             edit.putLong("lockedUntil", now + wait)
         }
         edit.commit()
         return VerifyResult.Wrong(fails)
+    }
+
+    private companion object {
+        const val MAX_WAIT_MS = 3_600_000L
     }
 
     private fun hash(password: String, salt: ByteArray): ByteArray =
@@ -60,11 +70,14 @@ class PasswordStore(ctx: Context) {
             .encoded
 }
 
-/** 비밀번호 입력 후 5분 동안만 앱 안에서 규칙을 바꿀 수 있다. 메모리에만 유지된다. */
+/**
+ * 비밀번호 입력 후 5분 동안만 앱 안에서 규칙을 바꿀 수 있다. 메모리에만 유지된다.
+ * 벽시계가 아니라 부팅 이후 단조 시계를 쓰므로 시각 변경으로 유효 시간을 늘릴 수 없다.
+ */
 object Session {
     private var unlockedUntil = 0L
 
-    fun isUnlocked(): Boolean = System.currentTimeMillis() < unlockedUntil
-    fun unlock() { unlockedUntil = System.currentTimeMillis() + 5 * 60_000L }
+    fun isUnlocked(): Boolean = unlockedUntil != 0L && SystemClock.elapsedRealtime() < unlockedUntil
+    fun unlock() { unlockedUntil = SystemClock.elapsedRealtime() + 5 * 60_000L }
     fun lock() { unlockedUntil = 0L }
 }

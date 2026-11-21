@@ -9,10 +9,10 @@ class DeviceLockAdminReceiver : DeviceAdminReceiver() {
     override fun onEnabled(context: Context, intent: Intent) {
         super.onEnabled(context, intent)
         PolicyController(context).applyBaseline()
-        RuleEngine.evaluate(context)
+        RuleEngine.evaluate(context, force = true)
     }
 
     override fun onDisableRequested(context: Context, intent: Intent): CharSequence {
-        return "이 앱은 기기 제한 용도로 관리되고 있어 비활성화할 수 없습니다."
+        return "이 앱은 기기 제한 용도로 관리되고 있어 비활성화할 수 없습니다. 제거하려면 앱 안에서 비밀번호를 입력하세요."
     }
 }
